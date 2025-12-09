@@ -1,0 +1,785 @@
+---
+title: "Macroinvertebrates of the Timpanogos Cave System, Utah - Data Analysis"
+author: "Adam Simpson"
+format:
+  html:
+    embed-resources: true
+editor: visual
+---
+
+```{r}
+#| include: FALSE
+#| echo: FALSE
+#| warning: FALSE
+
+set.seed(31415)
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(vegan)
+library(gridExtra)
+library(indicspecies)
+library(lubridate)
+library(MASS)
+library(lme4)
+library(nlme)
+library(lmerTest)
+library(cluster)
+library(class)
+df.all = read.csv('MasterTableAll.csv')[,-c(1:2)]
+df.all$Study = as.factor(df.all$Study)
+df.all$TrapNumber = as.factor(df.all$TrapNumber)
+df.all$SpecimenAmountPerDay = df.all$SpecimenAmount / df.all$TimeDiff
+
+df.new = read.csv('timpCaveAllSpecimensAllConditionsNew.csv')
+df.new = df.new %>% 
+  mutate(ObsEndDate = as.Date(ObsEndDate, "%m/%d/%y")) %>% 
+  # mutate(ObsEndDate = as.Date(ObsEndDate)) %>% 
+  arrange(ObsEndDate) %>% 
+  mutate(Study = c(rep("2003-04",742), rep("2023",254)),
+         Study = as.factor(Study)) %>% 
+  drop_na(SpeciesLatinName) %>% 
+  distinct()
+
+traps = df.new %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  mutate(SpeciesLatinName = sub('Isotomidae', 'Oncopoduridae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Sminthuridae', 'Arrhopalitidae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Opilionida', 'Sabaconidae', SpeciesLatinName)) %>%
+  na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0) %>% 
+  arrange(as.numeric(TrapNumber))
+```
+
+# Data Cleaning
+
+It's important that every time a trap was checked for a specific bug, an observation is recorded, even if it is a 0. For example: if trap 34 is checked one day and it is empty, it should still receive a 0 in specimen amount for every possible specimen. This creates a large data frame - the number of rows is (# of dates) \* (# of traps) \* (# of specimens) for each study. Over 100,000 rows! But this allows for correct comparison of traps.
+
+```{r}
+#| warning: FALSE
+# First, make sure each bug has a 0 when it wasn't found.
+study1traps = traps %>% 
+  filter(Study == "2003-04") %>% 
+  dplyr::select(TrapNumber)
+
+study2traps = read.csv('study2traps.csv')
+
+study1dates = unique(df.new[df.new$Study=="2003-04",]$ObsEndDate)
+study2dates = unique(df.new[df.new$Study=="2023",]$ObsEndDate)
+
+study1timediff = read.csv('timediffstudy1.csv')$x
+study2timediff = rep(14, length(study2dates))
+
+bugs = unique(df.new$SpeciesLatinName)
+
+study1fulldf = data.frame('ObsEndDate' = rep(study1dates,each=length(bugs)*length(study1traps$TrapNumber)),
+                          'TimeDiff' = rep(study1timediff,each=length(bugs)*length(study1traps$TrapNumber)),
+                    'TrapNumber' = rep(study1traps$TrapNumber, length(study1dates), each=length(bugs)),
+                    'SpeciesLatinName' = rep(bugs, length(study1dates)*length(study1traps$TrapNumber)),
+                    'SpecimenAmount' = rep(0, length(study1dates)*length(bugs)*length(study1traps$TrapNumber)),
+                    'Study' = rep("2003-04", length(study1dates)*length(bugs)*length(study1traps$TrapNumber)))
+study2fulldf = data.frame('ObsEndDate' = rep(study2dates,each=length(bugs)*length(study2traps$TrapNumber)),
+                          'TimeDiff' = rep(study2timediff,each=length(bugs)*length(study2traps$TrapNumber)),
+                    'TrapNumber' = rep(study2traps$TrapNumber, length(study2dates), each=length(bugs)),
+                    'SpeciesLatinName' = rep(bugs, length(study2dates)*length(study2traps$TrapNumber)),
+                    'SpecimenAmount' = rep(0, length(study2dates)*length(bugs)*length(study2traps$TrapNumber)),
+                    'Study' = rep("2023", length(study2dates)*length(bugs)*length(study2traps$TrapNumber)))
+
+study.bind = rbind(study1fulldf, study2fulldf)
+for (i in 1:nrow(df.new)) {
+  date = df.new$ObsEndDate[i]
+  trap = df.new$TrapNumber[i]
+  name = df.new$SpeciesLatinName[i]
+  study.bind[which(study.bind$ObsEndDate == date & study.bind$TrapNumber==trap & study.bind$SpeciesLatinName==name),'SpecimenAmount'] = df.new$SpecimenAmount[i]
+}
+
+# fulldf = merge(study.bind, df.new, 
+#                by=c('ObsEndDate', 'TrapNumber', 'SpeciesLatinName'), all.x=TRUE)
+
+df.full = study.bind %>% 
+  mutate(cave=0,
+         zone=0) %>% 
+  mutate(SpecimenAmountPerDay = SpecimenAmount/TimeDiff)
+  
+
+### Add in zone and cave
+
+zones = df.new %>% 
+  distinct(TrapNumber, zone) %>% 
+  add_row(TrapNumber="41", zone='Dark')
+
+for (i in 1:nrow(df.full)) {
+  trap = df.full$TrapNumber[i]
+  df.full$zone[i] = zones[which(zones$TrapNumber==trap),"zone"]
+}
+
+caves = df.new %>% 
+  distinct(TrapNumber, cave) %>% 
+  add_row(TrapNumber="41", cave='Hansen') %>% 
+  mutate(cave = if_else(TrapNumber %in% c('86','87'), "Timpanogos", cave))
+
+for (i in 1:nrow(df.full)) {
+  trap = df.full$TrapNumber[i]
+  df.full$cave[i] = caves[which(caves$TrapNumber==trap),"cave"]
+}
+
+### Add in temp, RH, resident?
+```
+
+# Analysis Questions
+
+1.  Are the 2 communities (2003 vs 2023) different? What is different about them?
+
+2.  Do different zones within the cave have different animals?
+
+3.  Do different caves have different animals?
+
+4.  What is the effect of "resident" vs "visitor" animals?
+
+5.  Does temperature and relative humidity affect the communities?
+
+## Question 1 - Differences in Communities
+
+### Linear Regression Approach
+
+We fit a linear regression model. We use linear regression here rather than poisson regression (typically used for count data) because we are modeling specimen amount per day, rather than specimen amount at time of collection. Doing this changes integers to decimals (thus why we cannot use poisson regression) and also accounts for the difference in collection time periods. Thus, we model the number of specimens found of species "x" per day in the "ith" trap of the "jth" study. Our model is as follows:
+
+$$ 
+Y_{xij} = (\gamma_1 + \beta_{0i}) + \gamma_2 + \phi_x + \delta_{xj} + \epsilon_{xij} 
+$$
+
+$\gamma_1$ represents the mean for study 1, $\beta_{0i}$ represents the change in intercept based on trap, $\gamma_2$ represents the change in mean for study 2, $\phi_x$ represents the change in mean for species "x", $\delta_{xj}$ represents the change in mean for species "x" in study 2 vs. study 1, and $\epsilon_{xij} \sim N(0, \sigma^2)$ is a Gaussian error term.
+
+Because we have accounted for variation in both the time and trap effect, we can isolate the study effect per species through this model. Any significant $\delta_{xj}$ coefficient indicates a difference in population of that particular species across studies, with the sign of the coefficient explaining whether the population is larger or smaller in Study 2.
+
+```{r}
+## Poisson regression (response is Specimen amount, trap either random or factor fixed effect, look at interaction between species and study, potentially date as a random effect)
+
+# poismod = glmer(SpecimenAmount ~ SpeciesLatinName*Study + (1|TrapNumber), data=df.all, family='poisson')
+# summary(poismod)
+
+# Linear Regression looking only at total specimen amount, checking for significant interactions between species and study.
+# Including trap as a random effect.
+# Account for difference in days between observation.
+# A significant interaction shows that one study saw more of a certain bug than the other.
+# A positive value signifies study 2 saw it more, a negative value that study 1 saw it more.
+
+
+# df.short = df.full %>% 
+#   rename(Name = SpeciesLatinName) %>% 
+#   mutate(Study = as.factor(Study))
+
+### Poisson Mixed Effects Model - Takes a long time!!!
+# mod = glmer(SpecimenAmount ~ Bug*Study + (1|TrapNumber),
+#           data=df.short, family='poisson')
+# round(coef(summary(mod)),3)
+
+### Poisson Model, treat trap as a fixed effect
+# mod = glm(SpecimenAmount ~ Name*Study + as.factor(TrapNumber), data=df.short, family='poisson')
+# summary(mod)
+
+
+df.full$SpeciesLatinName = as.factor(df.full$SpeciesLatinName)
+df.full$SpeciesLatinName = relevel(df.full$SpeciesLatinName, ref='Entomobryidae') # Relevel to something both studies have in common
+df.full$Study = as.factor(df.full$Study)
+mod = lmer(SpecimenAmountPerDay ~ SpeciesLatinName*Study + (1|TrapNumber),
+             data=df.full)
+summary(mod)
+
+```
+
+This model identifies 3 significant differences in species across the two studies:
+
+-   Hypogastruridae were found more abundantly in Study 1
+-   Sciaridae were found more abundantly in Study 1
+-   Oncopoduridae were found more abundantly in Study 2
+-   Acari were found more abundantly in Study 1 - though, they likely weren't classified as thoroughly as in Study 2
+
+### Multidimensional Scaling and ANOSIM - Euclidean Distance
+
+```{r}
+#| warning: FALSE
+## Multidimensional scaling (class or cluster package)
+# Build a distance matrix with trap number and animal count
+# This will give a "similarity matrix" between traps
+
+traps = df.full %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  # na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+
+distmat = daisy(traps[,-c(1:4)],metric='euclidean')
+mds_result = as.data.frame(cmdscale(distmat, k=2))
+colnames(mds_result) = c('X', 'Y')
+mds_result$Study = traps$Study
+mds_result$TrapNumber = traps$TrapNumber
+# mds_result$Y = mds_result$Y*-1
+
+png(filename='MDS_study.png', width=600, height=450)
+ggplot(data=mds_result, mapping=aes(x=X,y=Y,color=Study)) +
+  geom_point(size=3) +
+  theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
+        axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
+        legend.text = element_text(size = 24, face ="bold", colour ="black"), 
+        legend.position = "right", 
+        axis.title.y = element_text(face = "bold", size = 24, colour='black'), 
+        axis.title.x = element_text(face = "bold", size = 24, colour = "black"),
+        legend.title = element_text(size = 30, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+        legend.key=element_blank()) + 
+  labs(x = "Dimension 1", colour = "Study", y = "Dimension 2") + 
+  scale_colour_manual(values = c("#009E73", "#E69F00")) + 
+  annotate('text', x=-1.025, y=0.6, label='78',size=7) +
+  annotate('text', x=-0.6, y=0.375, label='81', size=7) +
+  annotate('text', x=0.5, y=0.5, label='11 & 9', size=7) +
+  annotate('text', x=0.6, y=0.775, label='8', size=7) + 
+  ggtitle('A: Euclidean MDS') +
+  theme(plot.title = element_text(hjust = 0.5, face='bold', size=36))
+dev.off()
+
+```
+
+Using euclidean distance for measuring similarity is the most common method in statistics because of its interpretable mathematical properties. We imagine each trap is a vector (the bad guy in Despicable Me - "both direction and magnitude!") in high dimensional space. We cannot visualize dimensions above 3D, so we use multidimensional scaling to "squish" the dimensions into 2D space for easy plotting. If two traps tend to attract different species, their vectors in space will be further apart, and thus their points on the squished plot will also be further apart.
+
+Cool observations about this plot:
+
+It's always interesting to study the traps that are furthest away from clusters in plots like this. Notice the labeled traps. They are far apart based on Dimension 1, but close together based on Dimension 2. What could those dimensions be? It's more clear in later plots that dimension 1 is possibly the different caves - traps 8-11 are in Hansen cave while traps 78-81 are in Timpanogos. But then what could Dimension 2 be? Perhaps proximity to the tour entrances and exits? Type of rock the traps are on? Proximity to water? It could be anything! It's impossible to know for sure, but this would be a good avenue to study. Your expertise on caves and bugs makes you much better able to answer this question.
+
+Also, another explanation for dimension 1 is the different study - the plots on the left are from study 1, and the ones on the right from study 2. It seems the red dots move out to the left while the blue ones move out to the right. So then, once again, why are they similar on Dimension 2?
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+
+traps = df.full %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  mutate(SpeciesLatinName = sub('Isotomidae', 'Oncopoduridae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Sminthuridae', 'Arrhopalitidae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Opilionida', 'Sabaconidae', SpeciesLatinName)) %>%
+  na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+com <- traps[,5:ncol(traps)]
+m_com <- as.matrix(com)
+
+ano = anosim(m_com, traps$Study, distance = 'euclidean', permutations = 999)
+ano
+
+inv = multipatt(com, traps$Study, func = 'r.g', control = how(nperm=999))
+summary(inv)
+
+```
+
+From Wikipedia: "Given a matrix of rank dissimilarities between a set of samples, each belonging to a single site (e.g. a single treatment group), the ANOSIM tests whether we can reject the null hypothesis that the similarity between sites is greater than or equal to the similarity within each site."
+
+The ANOSIM results here are interesting. We get a significant p-value, but our R statistic is so small (around 0.03ish) that the difference may not be all that great. We have a lot of data, meaning we can detect the slightest of differences in communities, but is that difference practical? That small R statistic tells us that, yes, there is slightly more variability across studies than within studies, but not by much.
+
+I did a little bit of searching into how multilevel pattern analysis works. It seems to be a permuation test where species in the given X matrix are put into random partitions based on their prevalence in the given input clusters. From the R help page: "This function creates combinations of the input clusters and compares each combination with the species in the input matrix x. For each species it chooses the combination with a highest association value. Best matching patterns are tested for statistical significance of the associations." For the paper it's probably best just to site a research paper that goes more into depth.
+
+We see similar species pop up in the Multilevel pattern analysis here as in our regression model - Acari, Sciaridae, and Hypogastruridae in Study 1, and Oncopoduridae in Study 2. The other species that pop really only appear because there were literally 0 of that species found in the other study: Staphylinidae was found 6 times in study 1 and 0 in study 2, and Damaeidae was found 12 times in study 2 and 0 in study 1. Those species didn't appear in our regression model because they were so sparse in the first place, but a partition test like Multilevel pattern analysis will pick them up. Is it possible there's a difference in population for these species across studies? Certainly! But with so few data, can we really be sure? Our conclusion for these species isn't as strong as for the species that appear in our regression model.
+
+### Nonmetric Multidimensional Scaling and ANOSIM - Bray-Curtis Dissimilarity
+
+```{r}
+
+set.seed(31415)
+traps = df.new %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  mutate(SpeciesLatinName = sub('Isotomidae', 'Oncopoduridae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Sminthuridae', 'Arrhopalitidae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Opilionida', 'Sabaconidae', SpeciesLatinName)) %>%
+  na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+com <- traps[,5:ncol(traps)]
+m_com <- as.matrix(com)
+
+nmds = metaMDS(m_com, distance = 'bray', trace=0)
+
+data.scores = as.data.frame(scores(nmds)$sites)
+data.scores$TrapNumber = traps$TrapNumber
+data.scores$Study = traps$Study
+
+png(filename='NMDS_study.png', width=600, height=450)
+ggplot(data.scores, aes(x = NMDS1, y = NMDS2)) + 
+  geom_point(size = 3, aes(colour = Study))+ 
+  theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
+        axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
+        legend.text = element_text(size = 24, face ="bold", colour ="black"), 
+        legend.position = "right", 
+        axis.title.y = element_text(face = "bold", size = 24, colour='black'), 
+        axis.title.x = element_text(face = "bold", size = 24, colour = "black"),
+        legend.title = element_text(size = 30, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+        legend.key=element_blank()) + 
+  labs(x = "Dimension 1", colour = "Study", y = "Dimension 2")  + 
+  scale_colour_manual(values = c("#009E73", "#E69F00")) +
+  annotate('text', x=2.75, y=1.8, label='28,38,69,C',size=7) +
+  annotate('text', x=18, y=-1.8, label='31',size=7) +
+  annotate('text', x=-0.7, y=-2.2, label='25',size=7) +
+  annotate('text', x=-0.8, y=-2.6, label='68',size=7) + 
+  annotate('text', x=-1.6, y=2.4, label='35',size=7) + 
+  ggtitle('B: Bray-Curtis NMDS') +
+  theme(plot.title = element_text(hjust = 0.5, face='bold', size=36))
+dev.off()
+```
+
+It's interesting to see the differences between the euclidean plot and this one. I don't know enough details to explain why they're different. Perhaps looking at these specific traps and understanding why they are different would help? See why Trap 31 is so far away on the X-axis, and why the other small clusters are far away on the Y-axis.
+
+It does seem that euclidean captures the geography a bit more - you can sort of see the layout of the 3 caves, whereas with this one you don't.
+
+```{r}
+ano = anosim(m_com, traps$Study, distance = 'bray', permutations = 999)
+ano
+```
+
+The ANOSIM gives a slightly larger R statistic, indicating more between-study variability than within-study (more evidence of a difference in populations). Perhaps this Bray-Curtis dissimilarity does a better job at detecting population dissimilarity than euclidean distance?
+
+## Question 2 - Zones
+
+### Linear Regression
+
+```{r}
+df.full$zone = as.factor(df.full$zone)
+df.full$SpeciesLatinName = as.factor(df.full$SpeciesLatinName)
+df.full$SpeciesLatinName = relevel(df.full$SpeciesLatinName, ref='Acari') # Change reference level to something found in both groups
+df.full$zone = relevel(df.full$zone, ref='Dark')
+summary(lmer(SpecimenAmountPerDay ~ SpeciesLatinName*zone + (1|TrapNumber), data=df.full))
+
+# design = model.matrix(SpecimenAmountPerDay ~ 0 + zone:SpeciesLatinName + TrapNumber, data=df.full)
+# 
+# mod = lm(df.full$SpecimenAmountPerDay ~ 0 + design, x=TRUE, y=TRUE)
+# summary(mod)
+# 
+# W=mod$x[,1:171]
+# Y=mod$y
+# s2 <- ( 1 / (dim(W)[1] - dim(W)[2])) * t(Y - W %*% beta_hat) %*% (Y - W %*% beta_hat)
+# for (i in 1:41) {
+#   print(i)
+#   beta_hat <- coef(mod)[1:171]
+#   C=matrix(rep(0,171),nrow=1)
+#   C[,c((i*2-1)+89, (i*2-1)+90)] = c(1,-1)
+# 
+#   t <- C %*% beta_hat / sqrt( s2 * C %*% ginv(t(W) %*% W) %*% t(C))
+#   pval <- 2 * (1 - pt(abs(t), dim(W)[1] - dim(W)[2]))
+#   if (pval<0.05) print(c(t, pval))
+# }
+
+```
+
+We detect a few differences in species populations between dark and twilight areas:
+
+-   Hypogastruridae, Mycetophilidae, Oncopoduridae, Sciaridae, and Tomoceridae seem to be found more in the twilight than the dark.
+-   Many other species (all the ones with a dot) seem to be found more in the dark zones.
+
+Now, this result seems odd, since we actually see every one of these species is found more in the dark than in the twilight. HOWEVER, it's very important to note that there are many more traps in the dark than in the twilight - in fact, in Study 1, 71/83 traps are in the dark, and in Study 2, 63/75 traps are in the dark. This model, through averaging, assumes that because there are more traps in the dark there should be proportionally more animals found in the dark. Thus, despite there being more of these species found in the dark traps altogether, the model suggests there are actually more of these species in the twilight because, proportionally per trap, there were more found in the twilight areas.
+
+To demonstrate: In total across both studies, there were 290 Sciaridae found in the dark and only 135 found in the twilight. However, when you account for the fact that 84% of the traps were in the dark, we find only 2.16 Sciaridae per dark trap and a whopping 5.625 per twilight trap! Our model deems this difference large enough to be significant. Thus, we say there are more Sciaridae in the twilight than in the dark.
+
+Whether this assumption of "species per trap" is valid is a different discussion entirely. However, I think for our purposes and for an added measure of simplicity, this is a fine assumption to make.
+
+```{r}
+traps %>% 
+  group_by(Study, zone) %>% 
+  summarize(count = n())
+```
+
+### MDS and ANOSIM - Euclidean Distance
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+
+traps = df.full %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  # na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+distmat = daisy(traps[,-c(1:4)],metric='euclidean')
+mds_result = as.data.frame(cmdscale(distmat, k=2))
+colnames(mds_result) = c('X', 'Y')
+mds_result$Study = traps$Study
+mds_result$TrapNumber = traps$TrapNumber
+mds_result$Zone = traps$zone
+mds_result$Cave = traps$cave
+
+### Zone
+png(filename='MDS_zone.png', width=600,height=450)
+ggplot(data=mds_result, mapping=aes(x=X,y=Y,color=Zone)) +
+  geom_point(size=3) +
+  scale_color_manual(values = c("Dark" = 'black', "Twilight" = 'gray')) +
+  theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
+        axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
+        legend.text = element_text(size = 24, face ="bold", colour ="black"), 
+        legend.position = "right", 
+        axis.title.y = element_text(face = "bold", size = 24, colour='black'), 
+        axis.title.x = element_text(face = "bold", size = 24, colour = "black"),
+        legend.title = element_text(size = 30, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+        legend.key=element_blank()) + 
+  labs(x = "Dimension 1", colour = "Zone", y = "Dimension 2") +
+  annotate('text', x=-1.025, y=0.6, label='78',size=7) +
+  annotate('text', x=-0.6, y=0.375, label='81', size=7) +
+  annotate('text', x=0.5, y=0.5, label='11 & 9', size=7) +
+  annotate('text', x=0.6, y=0.775, label='8', size=7) + 
+  ggtitle('A: Euclidean MDS') +
+  theme(plot.title = element_text(hjust = 0.5, face='bold', size=36))
+dev.off()
+```
+
+We don't see much in this plot. It seems that dark and twilight are fairly similar.
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+
+m_com = as.matrix(traps[,-c(1:4)])
+
+### All caves ###
+ano = anosim(m_com, traps$zone, distance = 'euclidean', permutations = 999)
+ano
+inv = multipatt(m_com, traps$zone, func = 'r.g', control = how(nperm=999))
+summary(inv)
+```
+
+The ANOSIM actually tells us that twilight and dark environments are different. Interesting. The animals reported above seem to frequent twilight areas more than dark. It's interesting that some of them are different from the animals our model predicted. It's likely due to the same reason as stated above - even though they were found more in the dark, when we look at "per trap", they were more frequent in the twilight.
+
+### NMDS and ANOSIM - Bray-Curtis Dissimilarity
+
+```{r}
+
+set.seed(31415)
+traps = df.new %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  mutate(SpeciesLatinName = sub('Isotomidae', 'Oncopoduridae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Sminthuridae', 'Arrhopalitidae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Opilionida', 'Sabaconidae', SpeciesLatinName)) %>%
+  na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+com <- traps[,5:ncol(traps)]
+m_com <- as.matrix(com)
+
+nmds = metaMDS(m_com, distance = 'bray', trace=0)
+
+data.scores = as.data.frame(scores(nmds)$sites)
+data.scores$TrapNumber = traps$TrapNumber
+data.scores$Study = traps$Study
+data.scores$Zone = traps$zone
+
+png(filename='NMDS_zone.png', width=600, height=450)
+ggplot(data.scores, aes(x = NMDS1, y = NMDS2)) + 
+  geom_point(size = 4, aes(colour = Zone))+ 
+  theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
+        axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
+        legend.text = element_text(size = 24, face ="bold", colour ="black"), 
+        legend.position = "right", 
+        axis.title.y = element_text(face = "bold", size = 24, colour='black'), 
+        axis.title.x = element_text(face = "bold", size = 24, colour = "black"),
+        legend.title = element_text(size = 30, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+        legend.key=element_blank()) + 
+  labs(x = "Dimension 1", colour = "Zone", y = "Dimension 2")  + 
+  scale_colour_manual(values = c("black", "gray")) +
+  annotate('text', x=2.75, y=1.8, label='28,38,69,C',size=7) +
+  annotate('text', x=18, y=-1.8, label='31',size=7) +
+  annotate('text', x=-0.7, y=-2.2, label='25',size=7) +
+  annotate('text', x=-0.8, y=-2.6, label='68',size=7) + 
+  annotate('text', x=-1.6, y=2.4, label='35',size=7) + 
+  ggtitle('B: Bray-Curtis NMDS') +
+  theme(plot.title = element_text(hjust = 0.5, face='bold', size=36))
+dev.off()
+```
+
+It seems the Bray-Curtis dissimilarity might take zone more into account than euclidean does - the outliers are all dark!
+
+```{r}
+ano = anosim(m_com, traps$zone, distance = 'bray', permutations = 999)
+ano
+```
+
+The ANOSIM using Bray-Curtis actually doesn't detect a difference in zone... Interesting.
+
+## Question 3 - Caves
+
+### Linear Regression
+
+```{r}
+df.full$cave = as.factor(df.full$cave)
+df.full$cave = relevel(df.full$cave, ref = 'Hansen')
+summary(lmer(SpecimenAmountPerDay ~ SpeciesLatinName*cave + (1|TrapNumber), data=df.full))
+
+
+df.full$cave = relevel(df.full$cave, ref = 'Middle')
+summary(lmer(SpecimenAmountPerDay ~ SpeciesLatinName*cave + (1|TrapNumber), data=df.full))
+```
+
+To summarize these 2 linear models:
+
+Comparing Hansen and Middle
+
+-   Hansen has more Mycetophilidae, Oncopoduridae, and Tomoceridae
+-   Middle has more Hypogastruridae
+
+Comparing Middle and Timp
+
+-   Middle has more Hypogastruridae
+-   Timp has more Mycetophilidae, Sciaridae, and Tomoceridae
+
+Comparing Hansen and Timp
+
+-   Hansen has more Hypogastruridae and Oncopoduridae
+-   Timp has more Mycetophilidae and Sciaridae
+
+So...
+
+-   It seems that Mycetophilidae prefer the outer caves, but mostly Timp
+-   It seems that Sciaridae definitely prefer Timp
+-   It seems that Oncopoduridae prefer Hansen
+-   It seems that Tomoceridae are more common in the outer caves, neither in particular
+-   It seems that Hypogastruridae prefer the Middle cave
+
+It's like a logic puzzle haha
+
+### MDS Plots and ANOSIM - Euclidean Distance
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+
+traps = df.full %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  # na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+distmat = daisy(traps[,-c(1:4)],metric='euclidean')
+mds_result = as.data.frame(cmdscale(distmat, k=2))
+colnames(mds_result) = c('X', 'Y')
+mds_result$Study = traps$Study
+mds_result$TrapNumber = traps$TrapNumber
+mds_result$Zone = traps$zone
+mds_result$Cave = traps$cave
+
+### Cave
+png(filename='MDS_cave.png', width=600, height=450)
+ggplot(data=mds_result, mapping=aes(x=X,y=Y,color=Cave)) +
+  geom_point(size=3) +
+  scale_color_manual(values = c("Hansen" = 'pink', "Middle" = 'orange', "Timpanogos" = 'red')) +
+  theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
+        axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
+        legend.text = element_text(size = 24, face ="bold", colour ="black"), 
+        legend.position = "right", 
+        axis.title.y = element_text(face = "bold", size = 24, colour='black'), 
+        axis.title.x = element_text(face = "bold", size = 24, colour = "black"),
+        legend.title = element_text(size = 30, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+        legend.key=element_blank()) + 
+  labs(x = "Dimension 1", colour = "Cave", y = "Dimension 2") +
+  annotate('text', x=-1.025, y=0.6, label='78',size=7) +
+  annotate('text', x=-0.6, y=0.375, label='81', size=7) +
+  annotate('text', x=0.5, y=0.5, label='11 & 9', size=7) +
+  annotate('text', x=0.6, y=0.775, label='8', size=7) + 
+  ggtitle('A: Euclidean MDS') +
+  theme(plot.title = element_text(hjust = 0.5, face='bold', size=36))
+dev.off()
+```
+
+And here we see the likely cause for the shape we keep seeing. It's clear that Timp takes off to the left and Hansen the right, with Middle chilling in the middle! You can sort of visualize the geography here - the cave tour starts over at Hansen, moves through Middle, and exits through Timp (maybe it needs to be reflected over the Y-axis to line it up?) This likely explains a leading characteristic of Dimension 1 - different caves. It still isn't clear what causes Dimension 2. Maybe Trap 78 (top left) and Trap 8 (top right) are near their respective entrance/exit?
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+
+m_com = as.matrix(traps[,-c(1:4)])
+
+### All caves ###
+ano = anosim(m_com, traps$cave, distance = 'euclidean', permutations = 999)
+ano
+inv = multipatt(m_com, traps$cave, func = 'r.g', control = how(nperm=999))
+summary(inv)
+
+### Just Hansen vs. Timp
+ano = anosim(m_com[which(traps$cave!='Middle'),], traps$cave[which(traps$cave!='Middle')], distance = 'euclidean', permutations = 999)
+ano
+inv = multipatt(m_com[which(traps$cave!='Middle'),], traps$cave[which(traps$cave!='Middle')], func = 'r.g', control = how(nperm=999))
+summary(inv)
+
+### Just Hansen vs. Middle
+ano = anosim(m_com[which(traps$cave!='Timpanogos'),], traps$cave[which(traps$cave!='Timpanogos')], distance = 'euclidean', permutations = 999)
+ano
+inv = multipatt(m_com[which(traps$cave!='Timpanogos'),], traps$cave[which(traps$cave!='Timpanogos')], func = 'r.g', control = how(nperm=999))
+summary(inv)
+
+### Just Timp vs. Middle
+ano = anosim(m_com[which(traps$cave!='Hansen'),], traps$cave[which(traps$cave!='Hansen')], distance = 'euclidean', permutations = 999)
+ano
+inv = multipatt(m_com[which(traps$cave!='Hansen'),], traps$cave[which(traps$cave!='Hansen')], func = 'r.g', control = how(nperm=999))
+summary(inv)
+
+```
+
+These are actually very cool! ANOSIM has a significant p-value when we consider all 3 caves. This is just saying "they are not all the same - at least one is different". It doesn't tell us which one is different. But the multilevel pattern analysis confirms some of the unique species found in each cave. We don't see Tomoceridae on the list because they can't be distinguished from Timp or Hansen (they're just not found in Middle). We only see the new arrival of Stigmaeidae because there were 2 found in Middle and 0 in both other caves. The others (Sciaridae and Mycetophilidae in Timp, Hypogastruridae in Middle, and Oncopoduridae in Hansen) were all detected by the model due to their BIG differences by cave.
+
+ANOSIM of each pair shows us which caves are truly different. Both Timp/Middle and Hansen/Middle comparisons don't show a dissimilarity; only Timp and Hansen do. That is clearly seen in the plot above as well.
+
+### NMDS and ANOSIM - Bray-Curtis Dissimilarity
+
+```{r}
+
+set.seed(31415)
+traps = df.new %>%
+  mutate(SpecimenAmount = as.numeric(SpecimenAmount)) %>%
+  group_by(Study, SpeciesLatinName, TrapNumber, zone, cave) %>%
+  summarize(SpecimenAmount = sum(SpecimenAmount)) %>%
+  mutate(SpeciesLatinName = sub('Isotomidae', 'Oncopoduridae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Sminthuridae', 'Arrhopalitidae', SpeciesLatinName)) %>%
+  mutate(SpeciesLatinName = sub('Opilionida', 'Sabaconidae', SpeciesLatinName)) %>%
+  na.omit() %>%
+  pivot_wider(names_from = SpeciesLatinName, values_from = SpecimenAmount, values_fill = 0)
+
+traps = as.data.frame(traps)
+for (i in 1:nrow(traps)) {
+  divisor = ifelse(traps[i,"Study"] == "2003-04", 48, 16)  
+  traps[i,-c(1:4)] = traps[i,-c(1:4)]/divisor
+}
+
+com <- traps[,5:ncol(traps)]
+m_com <- as.matrix(com)
+
+nmds = metaMDS(m_com, distance = 'bray', trace=0)
+
+data.scores = as.data.frame(scores(nmds)$sites)
+data.scores$TrapNumber = traps$TrapNumber
+data.scores$Study = traps$Study
+data.scores$Zone = traps$zone
+data.scores$Cave = traps$cave
+
+png(filename='NMDS_cave.png', width=600, height=450)
+ggplot(data.scores, aes(x = NMDS1, y = NMDS2)) + 
+  geom_point(size = 4, aes(colour = Cave))+ 
+  theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
+        axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
+        legend.text = element_text(size = 24, face ="bold", colour ="black"), 
+        legend.position = "right", 
+        axis.title.y = element_text(face = "bold", size = 24, colour='black'), 
+        axis.title.x = element_text(face = "bold", size = 24, colour = "black"),
+        legend.title = element_text(size = 30, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+        legend.key=element_blank()) + 
+  labs(x = "Dimension 1", colour = "Cave", y = "Dimension 2")  + 
+  scale_colour_manual(values = c("pink", "orange", "red")) +
+  annotate('text', x=2.75, y=1.8, label='28,38,69,C',size=7) +
+  annotate('text', x=18, y=-1.8, label='31',size=7) +
+  annotate('text', x=-0.7, y=-2.2, label='25',size=7) +
+  annotate('text', x=-0.8, y=-2.6, label='68',size=7) + 
+  annotate('text', x=-1.6, y=2.4, label='35',size=7) + 
+  ggtitle('B: Bray-Curtis NMDS') +
+  theme(plot.title = element_text(hjust = 0.5, face='bold', size=36))
+dev.off()
+```
+
+It looks like the Bray-Curtis doesn't capture cave like euclidean does.
+
+```{r}
+### All caves ###
+ano = anosim(m_com, traps$cave, distance = 'bray', permutations = 999)
+ano
+
+### Just Hansen vs. Timp
+ano = anosim(m_com[which(traps$cave!='Middle'),], traps$cave[which(traps$cave!='Middle')], distance = 'bray', permutations = 999)
+ano
+
+### Just Hansen vs. Middle
+ano = anosim(m_com[which(traps$cave!='Timpanogos'),], traps$cave[which(traps$cave!='Timpanogos')], distance = 'bray', permutations = 999)
+ano
+
+### Just Timp vs. Middle
+ano = anosim(m_com[which(traps$cave!='Hansen'),], traps$cave[which(traps$cave!='Hansen')], distance = 'bray', permutations = 999)
+ano
+```
+
+The ANOSIM using Bray-Curtis actually detects dissimilarities in every cave pairing. Interesting!
+
+## Question 4 - Resident vs Visitor
+
+```{r}
+df.new %>% 
+  group_by(Study, resident) %>% 
+  summarize(count = n())
+```
+
+
+## Question 5 - Temperature and Relative Humidity
+
+### Modeling
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+### Check for interaction between temperature and species? temperature and study?
+
+poismod = glm(SpecimenAmount ~ temp*SpeciesLatinName, data=df.new, family='poisson')
+round(coef(summary(poismod)),3)
+
+poismod = glm(SpecimenAmount ~ temp*Study, data=df.new, family='poisson')
+summary(poismod)
+
+
+poismod = glm(SpecimenAmount ~ RH*Study, data=df.new, family='poisson')
+summary(poismod)
+
+poismod = glm(SpecimenAmount ~ RH*SpeciesLatinName, data=df.new, family='poisson')
+summary(poismod)
+```
+
+No significant p-values - temp and RH don't seem to have any affect on population over time or within each study.
