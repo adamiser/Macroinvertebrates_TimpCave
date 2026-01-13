@@ -124,6 +124,14 @@ for (i in 1:nrow(df.full)) {
   df.full$cave[i] = caves[which(caves$TrapNumber==trap),"cave"]
 }
 
+for (i in 1:nrow(df.full)) {
+  if (df.full$zone[i] == 'Dark') df.full$zone[i] = 'Deep'
+}
+
+for (i in 1:nrow(df.new)) {
+  if (df.new$zone[i] == 'Dark') df.new$zone[i] = 'Deep'
+}
+
 ### Add in temp, RH, resident?
 ```
 
@@ -183,7 +191,7 @@ Because we have accounted for variation in both the time and trap effect, we can
 df.full$SpeciesLatinName = as.factor(df.full$SpeciesLatinName)
 df.full$SpeciesLatinName = relevel(df.full$SpeciesLatinName, ref='Entomobryidae') # Relevel to something both studies have in common
 df.full$Study = as.factor(df.full$Study)
-mod = lmer(SpecimenAmountPerDay ~ SpeciesLatinName*Study + (1|TrapNumber),
+mod = lmer(SpecimenAmountPerDay ~ -1 + SpeciesLatinName*Study + (1|TrapNumber),
              data=df.full)
 summary(mod)
 
@@ -195,6 +203,23 @@ This model identifies 3 significant differences in species across the two studie
 -   Sciaridae were found more abundantly in Study 1
 -   Oncopoduridae were found more abundantly in Study 2
 -   Acari were found more abundantly in Study 1 - though, they likely weren't classified as thoroughly as in Study 2
+
+### Checking Acari
+
+As mentioned above, Acari were not classified as thoroughly in Study 2; thus, a significant difference in Acari was detected. Now, we reclassify the six Acari subspecies in Study 1 (Ameroseiidae, Damaeidae, Peoppiidae, Acaridae, Rhagidiidae, and Stigmaeidae) as "Acari" to more evenly compare total Acari numbers across the 2 studies.
+
+```{r}
+df.full.new = df.full
+newSpecies = c('Ameroseiidae', 'Damaeidae', 'Peoppiidae', 'Acaridae', 'Rhagidiidae', 'Stigmaeidae')
+for (i in 1:nrow(df.full.new)) {
+  if (df.full.new[i,'SpeciesLatinName'] %in% newSpecies) df.full.new[i,'SpeciesLatinName'] = 'Acari'
+}
+
+mod = lmer(SpecimenAmountPerDay ~ -1 + SpeciesLatinName*Study + (1|TrapNumber),
+             data=df.full.new)
+summary(mod)
+```
+
 
 ### Multidimensional Scaling and ANOSIM - Euclidean Distance
 
@@ -369,7 +394,7 @@ The ANOSIM gives a slightly larger R statistic, indicating more between-study va
 df.full$zone = as.factor(df.full$zone)
 df.full$SpeciesLatinName = as.factor(df.full$SpeciesLatinName)
 df.full$SpeciesLatinName = relevel(df.full$SpeciesLatinName, ref='Acari') # Change reference level to something found in both groups
-df.full$zone = relevel(df.full$zone, ref='Dark')
+df.full$zone = relevel(df.full$zone, ref='Deep')
 summary(lmer(SpecimenAmountPerDay ~ SpeciesLatinName*zone + (1|TrapNumber), data=df.full))
 
 # design = model.matrix(SpecimenAmountPerDay ~ 0 + zone:SpeciesLatinName + TrapNumber, data=df.full)
@@ -393,14 +418,14 @@ summary(lmer(SpecimenAmountPerDay ~ SpeciesLatinName*zone + (1|TrapNumber), data
 
 ```
 
-We detect a few differences in species populations between dark and twilight areas:
+We detect a few differences in species populations between deep and twilight areas:
 
--   Hypogastruridae, Mycetophilidae, Oncopoduridae, Sciaridae, and Tomoceridae seem to be found more in the twilight than the dark.
--   Many other species (all the ones with a dot) seem to be found more in the dark zones.
+-   Hypogastruridae, Mycetophilidae, Oncopoduridae, Sciaridae, and Tomoceridae seem to be found more in the twilight than the deep.
+-   Many other species (all the ones with a dot) seem to be found more in the deep zones.
 
-Now, this result seems odd, since we actually see every one of these species is found more in the dark than in the twilight. HOWEVER, it's very important to note that there are many more traps in the dark than in the twilight - in fact, in Study 1, 71/83 traps are in the dark, and in Study 2, 63/75 traps are in the dark. This model, through averaging, assumes that because there are more traps in the dark there should be proportionally more animals found in the dark. Thus, despite there being more of these species found in the dark traps altogether, the model suggests there are actually more of these species in the twilight because, proportionally per trap, there were more found in the twilight areas.
+Now, this result seems odd, since we actually see every one of these species is found more in the deep than in the twilight. HOWEVER, it's very important to note that there are many more traps in the deep than in the twilight - in fact, in Study 1, 71/83 traps are in the deep, and in Study 2, 63/75 traps are in the deep. This model, through averaging, assumes that because there are more traps in the deep there should be proportionally more animals found in the deep. Thus, despite there being more of these species found in the deep traps altogether, the model suggests there are actually more of these species in the twilight because, proportionally per trap, there were more found in the twilight areas.
 
-To demonstrate: In total across both studies, there were 290 Sciaridae found in the dark and only 135 found in the twilight. However, when you account for the fact that 84% of the traps were in the dark, we find only 2.16 Sciaridae per dark trap and a whopping 5.625 per twilight trap! Our model deems this difference large enough to be significant. Thus, we say there are more Sciaridae in the twilight than in the dark.
+To demonstrate: In total across both studies, there were 290 Sciaridae found in the deep and only 135 found in the twilight. However, when you account for the fact that 84% of the traps were in the deep, we find only 2.16 Sciaridae per deep trap and a whopping 5.625 per twilight trap! Our model deems this difference large enough to be significant. Thus, we say there are more Sciaridae in the twilight than in the deep.
 
 Whether this assumption of "species per trap" is valid is a different discussion entirely. However, I think for our purposes and for an added measure of simplicity, this is a fine assumption to make.
 
@@ -441,7 +466,7 @@ mds_result$Cave = traps$cave
 png(filename='MDS_zone.png', width=600,height=450)
 ggplot(data=mds_result, mapping=aes(x=X,y=Y,color=Zone)) +
   geom_point(size=3) +
-  scale_color_manual(values = c("Dark" = 'black', "Twilight" = 'gray')) +
+  scale_color_manual(values = c("Deep" = 'black', "Twilight" = 'gray')) +
   theme(axis.text.y = element_text(colour = "black", size = 14, face = "bold"), 
         axis.text.x = element_text(colour = "black", size=14, face = "bold"), 
         legend.text = element_text(size = 24, face ="bold", colour ="black"), 
@@ -461,7 +486,7 @@ ggplot(data=mds_result, mapping=aes(x=X,y=Y,color=Zone)) +
 dev.off()
 ```
 
-We don't see much in this plot. It seems that dark and twilight are fairly similar.
+We don't see much in this plot. It seems that deep and twilight are fairly similar.
 
 ```{r}
 #| warning: FALSE
@@ -476,7 +501,7 @@ inv = multipatt(m_com, traps$zone, func = 'r.g', control = how(nperm=999))
 summary(inv)
 ```
 
-The ANOSIM actually tells us that twilight and dark environments are different. Interesting. The animals reported above seem to frequent twilight areas more than dark. It's interesting that some of them are different from the animals our model predicted. It's likely due to the same reason as stated above - even though they were found more in the dark, when we look at "per trap", they were more frequent in the twilight.
+The ANOSIM actually tells us that twilight and deep environments are different. Interesting. The animals reported above seem to frequent twilight areas more than deep. It's interesting that some of them are different from the animals our model predicted. It's likely due to the same reason as stated above - even though they were found more in the deep, when we look at "per trap", they were more frequent in the twilight.
 
 ### NMDS and ANOSIM - Bray-Curtis Dissimilarity
 
@@ -533,7 +558,7 @@ ggplot(data.scores, aes(x = NMDS1, y = NMDS2)) +
 dev.off()
 ```
 
-It seems the Bray-Curtis dissimilarity might take zone more into account than euclidean does - the outliers are all dark!
+It seems the Bray-Curtis dissimilarity might take zone more into account than euclidean does - the outliers are all deep!
 
 ```{r}
 ano = anosim(m_com, traps$zone, distance = 'bray', permutations = 999)
